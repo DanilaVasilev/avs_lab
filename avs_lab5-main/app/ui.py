@@ -26,15 +26,23 @@ def find_similar_cats(image):
         if response.status_code == 200:
             results = response.json().get('results', [])
             
-            # Для демо версии - возвращаем тестовые изображения
-            # В реальном приложении здесь бы скачивались изображения из S3
-            test_images = []
-            for i in range(min(5, len(results))):
-                # Создаем тестовое изображение
-                img = Image.new('RGB', (224, 224), color=(i*50, 100, 150))
-                test_images.append(img)
+            # Загружаем реальные изображения из S3
+            similar_images = []
+            for result in results[:5]:  # Берем первые 5 результатов
+                try:
+                    # Скачиваем изображение по URL
+                    img_url = result.get('url')
+                    if img_url:
+                        img_response = requests.get(img_url, stream=True)
+                        img = Image.open(io.BytesIO(img_response.content))
+                        similar_images.append(img)
+                except Exception as e:
+                    print(f"Error loading image: {e}")
+                    # Если не удалось загрузить, используем заглушку
+                    img = Image.new('RGB', (224, 224), color='gray')
+                    similar_images.append(img)
             
-            return test_images
+            return similar_images
         else:
             return [Image.new('RGB', (224, 224), color='red')]
             
@@ -77,26 +85,22 @@ with gr.Blocks(title="Поиск похожих котиков 🐱", theme=gr.t
     )
     
     def upload_to_db(file):
-        """Загружает изображение в базу данных"""
-        if file is None:
-            return "Пожалуйста, выберите файл"
-        
-        try:
-            files = {'file': open(file.name, 'rb')}
-            response = requests.post(f"{API_URL}/upload", files=files)
-            
-            if response.status_code == 200:
-                return "Котик успешно добавлен в базу! 🎉"
-            else:
-                return f"Ошибка: {response.json().get('error', 'Unknown error')}"
-        except Exception as e:
-            return f"Ошибка: {str(e)}"
+    """Загружает изображение в базу данных"""
+    if file is None:
+        return "Пожалуйста, выберите файл"
     
-    upload_btn.upload(
-        fn=upload_to_db,
-        inputs=upload_btn,
-        outputs=gr.Textbox(label="Результат загрузки")
-    )
+    try:
+        # Получаем содержимое файла из объекта Gradio
+        with open(file.name, 'rb') as f:
+            files = {'file': f}
+            response = requests.post(f"{API_URL}/upload", files=files)
+        
+        if response.status_code == 200:
+            return "Котик успешно добавлен в базу! 🎉"
+        else:
+            return f"Ошибка: {response.json().get('error', 'Unknown error')}"
+    except Exception as e:
+        return f"Ошибка: {str(e)}"
 
 if __name__ == "__main__":
     demo.launch(
