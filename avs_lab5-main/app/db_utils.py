@@ -47,17 +47,22 @@ class VectorDB:
         self.conn.commit()
         cur.close()
 
-    def insert_image(self, embedding: np.ndarray, id: int):
-        if self.conn is None:
-            self.connect()
-        cur = self.conn.cursor()
-        emb_str = "[" + ",".join(map(str, embedding.tolist())) + "]"
-        cur.execute(
-            "INSERT INTO embeddings (id, embedding) VALUES (%s, %s);",
-            (id, emb_str),
-        )
-        self.conn.commit()
-        cur.close()
+    def insert_image(self, embedding: np.ndarray, img_id: str):
+    """Сохраняет эмбеддинг в базу данных"""
+    if self.conn is None:
+        self.connect()
+    cur = self.conn.cursor()
+    
+    # Конвертируем numpy array в список для PostgreSQL
+    embedding_list = embedding.tolist()
+    
+    # Вставка данных
+    cur.execute(
+        "INSERT INTO embeddings (id, embedding) VALUES (%s, %s);",
+        (img_id, embedding_list),  # PostgreSQL сам конвертирует список в vector
+    )
+    self.conn.commit()
+    cur.close()
 
     def find_similar(self, query_embedding: np.ndarray, limit: int = 5) -> List[Tuple]:
         if self.conn is None:
