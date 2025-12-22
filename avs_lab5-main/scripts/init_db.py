@@ -33,7 +33,7 @@ def init_dataset():
     
     for img_id, image_path in enumerate(tqdm(image_files, desc="Loading images", unit="img")):
         try:
-            embedding = embed_image(str(image_path), device="cpu")
+            embedding = embed_image(str(image_path))
             db.insert_image(embedding, img_id)
         except Exception:
             pass
