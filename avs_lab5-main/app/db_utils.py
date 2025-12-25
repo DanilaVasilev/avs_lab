@@ -1,10 +1,10 @@
-import boto3
-from botocore.client import Config
-from PIL import Image
-import io
 from typing import List, Tuple, Optional, Union
 import psycopg2
 import numpy as np
+from PIL import Image
+import io
+from minio import Minio
+from minio.error import S3Error
 
 class VectorDB:
     def __init__(self, db_url: str):
@@ -30,7 +30,7 @@ class VectorDB:
             );
             """
         )
-        
+        # Индекс для ускорения поиска
         cur.execute(
             """
             DO $$
@@ -47,22 +47,31 @@ class VectorDB:
         self.conn.commit()
         cur.close()
 
-    def insert_image(self, embedding: np.ndarray, img_id: str):
-    """Сохраняет эмбеддинг в базу данных"""
-    if self.conn is None:
-        self.connect()
-    cur = self.conn.cursor()
-    
-    # Конвертируем numpy array в список для PostgreSQL
-    embedding_list = embedding.tolist()
-    
-    # Вставка данных
-    cur.execute(
-        "INSERT INTO embeddings (id, embedding) VALUES (%s, %s);",
-        (img_id, embedding_list),  # PostgreSQL сам конвертирует список в vector
-    )
-    self.conn.commit()
-    cur.close()
+    def insert_image(self, embedding: np.ndarray, id: Optional[int] = None) -> int:
+        """
+        Вставляет эмбеддинг. Если id не передан, база сгенерирует его сама.
+        Возвращает ID вставленной записи.
+        """
+        if self.conn is None:
+            self.connect()
+        cur = self.conn.cursor()
+        emb_str = "[" + ",".join(map(str, embedding.tolist())) + "]"
+        
+        if id is not None:
+            cur.execute(
+                "INSERT INTO embeddings (id, embedding) VALUES (%s, %s) RETURNING id;",
+                (id, emb_str),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO embeddings (embedding) VALUES (%s) RETURNING id;",
+                (emb_str,),
+            )
+            
+        new_id = cur.fetchone()[0]
+        self.conn.commit()
+        cur.close()
+        return new_id
 
     def find_similar(self, query_embedding: np.ndarray, limit: int = 5) -> List[Tuple]:
         if self.conn is None:
@@ -76,6 +85,15 @@ class VectorDB:
         rows = cur.fetchall()
         cur.close()
         return rows
+    
+    def count_rows(self) -> int:
+        if self.conn is None:
+            self.connect()
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM embeddings;")
+        count = cur.fetchone()[0]
+        cur.close()
+        return count
 
     def close(self):
         if self.conn:
@@ -85,41 +103,60 @@ class VectorDB:
 
 class S3Storage:
     def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str):
-        self.s3_client = boto3.client(
-            's3',
-            endpoint_url=endpoint,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            config=Config(signature_version='s3v4')
-        )
+        """
+        Инициaлизaция S3-клиeнтa
+        endpoint: например 'minio:9000' (без http, если secure=False)
+        """
         self.bucket = bucket
-        self.endpoint = endpoint
-        self.ensure_bucket_exists()
+        # Minio клиент ожидает endpoint без протокола, если secure=False
+        clean_endpoint = endpoint.replace("http://", "").replace("https://", "")
+        
+        self.client = Minio(
+            clean_endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=False
+        )
 
     def ensure_bucket_exists(self):
-        try:
-            self.s3_client.head_bucket(Bucket=self.bucket)
-            print(f"Bucket {self.bucket} already exists")
-        except Exception as e:
-            print(f"Creating bucket {self.bucket}: {e}")
-            self.s3_client.create_bucket(Bucket=self.bucket)
-            print(f"Bucket {self.bucket} created")
+        """Пpoвepяeт сущeствoвaниe бaкeтa, сoздaёт eсли нужнo"""
+        if not self.client.bucket_exists(self.bucket):
+            self.client.make_bucket(self.bucket)
 
-    def upload_image(self, image_file, object_name: str) -> str:
+    def upload_image(self, image_file: Union[str, io.BytesIO], object_name: str) -> str:
+        """
+        Зaгpужaeт изoбpaжeниe в S3
+        """
+        # Если передан путь к файлу
         if isinstance(image_file, str):
-            with open(image_file, 'rb') as f:
-                self.s3_client.upload_fileobj(f, self.bucket, object_name)
+            self.client.fput_object(
+                self.bucket, object_name, image_file
+            )
+        # Если передан байтовый поток (из API)
         else:
-            self.s3_client.upload_fileobj(image_file, self.bucket, object_name)
+            image_file.seek(0, 2)
+            length = image_file.tell()
+            image_file.seek(0)
+            self.client.put_object(
+                self.bucket, object_name, image_file, length, content_type="image/jpeg"
+            )
         
-        return f"{self.endpoint}/{self.bucket}/{object_name}"
+        return object_name
 
     def download_image(self, object_name: str) -> Image.Image:
-        response = self.s3_client.get_object(Bucket=self.bucket, Key=object_name)
-        image_data = response['Body'].read()
-        return Image.open(io.BytesIO(image_data))
+        """
+        Скaчивaeт изoбpaжeниe из S3 и возвращает PIL Image
+        """
+        try:
+            response = self.client.get_object(self.bucket, object_name)
+            img_data = response.read()
+            response.close()
+            response.release_conn()
+            return Image.open(io.BytesIO(img_data)).convert("RGB")
+        except S3Error as e:
+            print(f"Error downloading {object_name}: {e}")
+            raise e
 
     def list_images(self, prefix: str = "") -> List[str]:
-        response = self.s3_client.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-        contents = response.get('Contents', [])
-        return [obj['Key'] for obj in contents]
+        objects = self.client.list_objects(self.bucket, prefix=prefix)
+        return [obj.object_name for obj in objects]
