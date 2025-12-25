@@ -1,91 +1,65 @@
 version: '3.8'
 
 services:
-  # База данных с поддержкой векторов
-  postgres:
+  # База данных с pgvector
+  db:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: cats
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: cats
+    ports:
+      - "5433:5432" # Пробрасываем на 5433, чтобы не конфликтовать с локальным PG
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  # S3-хранилище для изображений
+  # Объектное хранилище MinIO
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - minio_data:/data
     ports:
       - "9000:9000"
       - "9001:9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+    volumes:
+      - minio_data:/data
 
-  # API сервер
+  # Наш API сервис
   api:
     build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/cats
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadmin
-      S3_BUCKET: cats
-      DATA_DIR: /app/data/cat_images
-      PORT: 5000
+    command: python api.py
     ports:
       - "5000:5000"
-    volumes:
-      - ./data:/app/data
-      - ./app:/app/app
-    command: python app/api.py
+    environment:
+      DATABASE_URL: postgresql://postgres:postgrespassword@db:5432/cats
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: cats-images
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
 
-  # Gradio интерфейс
+  # UI интерфейс
   ui:
     build: .
-    depends_on:
-      - api
+    command: python ui.py
+    ports:
+      - "7860:7860"
     environment:
       API_URL: http://api:5000
       UI_PORT: 7860
-    ports:
-      - "7860:7860"
-    volumes:
-      - ./app:/app/app
-    command: python app/ui.py
-
-  # Инициализация базы данных (запускается один раз)
-  init-db:
-    build: .
     depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/cats
-      DATA_DIR: /app/data/cat_images
-    volumes:
-      - ./data:/app/data
-      - ./app:/app/app
-    command: python scripts/init_db.py
+      - api
 
 volumes:
   postgres_data:
