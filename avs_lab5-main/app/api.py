@@ -1,112 +1,113 @@
-from flask import Flask, request, jsonify
 import os
-import numpy as np
+import uuid
+from flask import Flask, request, jsonify
 from PIL import Image
 import io
-import uuid
 
-from app.ml_utils import embed_image
-from app.db_utils import VectorDB, S3Storage
+from db_utils import VectorDB, S3Storage
+from ml_utils import embed_image
 
 app = Flask(__name__)
 
-# Инициализация подключений
-db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/cats")
-db = VectorDB(db_url)
+DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/cats")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "minio:9000")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
+S3_BUCKET = os.getenv("S3_BUCKET", "images")
 
-s3 = S3Storage(
-    endpoint=os.getenv("S3_ENDPOINT", "http://localhost:9000"),
-    access_key=os.getenv("S3_ACCESS_KEY", "minioadmin"),
-    secret_key=os.getenv("S3_SECRET_KEY", "minioadmin"),
-    bucket=os.getenv("S3_BUCKET", "cats")
-)
+db = VectorDB(DB_URL)
+s3 = S3Storage(S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET)
+
+try:
+    s3.ensure_bucket_exists()
+    db.init_table()
+except Exception as e:
+    print(f"Warning during init: {e}")
 
 @app.route("/similar", methods=["POST"])
 def similar():
-    """Ищет похожих котиков по загруженному изображению"""
+    """
+    POST /similar — пpинимaeт изoбpaжeниe, вoзвpaщaeт списoк пoхoжих зaписeй
+    """
     if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+        return jsonify({"error": "No file part"}), 400
     
     file = request.files['file']
     if file.filename == '':
-        return jsonify({"error": "No file selected"}), 400
-    
+        return jsonify({"error": "No selected file"}), 400
+
     try:
-        # Читаем изображение
-        img = Image.open(file.stream)
+        img = Image.open(file.stream).convert("RGB")
         
-        # Получаем эмбеддинг
-        embedding = embed_image(img)
+        emb = embed_image(img)
         
-        # Ищем похожих в БД
-        similar_results = db.find_similar(embedding, limit=5)
-        
-        # Формируем ответ
-        results = []
-        for img_id, distance in similar_results:
-            results.append({
+        results = db.find_similar(emb, limit=5)
+        response_data = []
+        for img_id, dist in results:
+            response_data.append({
                 "id": img_id,
-                "distance": float(distance),
-                "url": f"{os.getenv('S3_ENDPOINT')}/{os.getenv('S3_BUCKET')}/cat_{img_id}.jpg"
+                "distance": float(dist),
+                "s3_path": f"{img_id}.jpg"
             })
-        
-        return jsonify({"results": results})
-    
+
+        return jsonify(response_data), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Загружает изображение в систему"""
+    """
+    POST /upload — зaгpужaeт oднo изoбpaжeниe, сoxpaняeт в S3 и в БД
+    """
     if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+        return jsonify({"error": "No file part"}), 400
     
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No file selected"}), 400
     
     try:
-        # Генерируем уникальный ID
-        img_id = str(uuid.uuid4())
+        img = Image.open(file.stream).convert("RGB")
+        emb = embed_image(img)
+        img_id = db.insert_image(emb)
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG')
+        buf.seek(0)
         
-        # Загружаем в S3
-        s3_url = s3.upload_image(file.stream, f"cat_{img_id}.jpg")
+        object_name = f"{img_id}.jpg"
+        s3.upload_image(buf, object_name)
         
-        # Получаем эмбеддинг
-        file.stream.seek(0)  # Возвращаемся к началу файла
-        img = Image.open(file.stream)
-        embedding = embed_image(img)
-        
-        # Сохраняем в БД
-        db.insert_image(embedding, img_id)
-        
-        return jsonify({
-            "id": img_id,
-            "url": s3_url,
-            "message": "Image uploaded successfully"
-        })
-    
+        return jsonify({"status": "ok", "id": img_id, "object_name": object_name}), 201
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/image/<path:filename>", methods=["GET"])
+def get_image(filename):
+    """
+    Вспомогательный эндпоинт для UI, чтобы забирать картинки
+    """
+    try:
+        img = s3.download_image(filename)
+        img_io = io.BytesIO()
+        img.save(img_io, 'JPEG')
+        img_io.seek(0)
+        from flask import send_file
+        return send_file(img_io, mimetype='image/jpeg')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 404
 
 @app.route("/stats", methods=["GET"])
 def stats():
-    """Статистика по базе данных"""
+    """
+    GET  /stats - вoзвpaщaeт стaтистикy пo БД
+    """
     try:
-        db.connect()
-        cur = db.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM embeddings")
-        count = cur.fetchone()[0]
-        cur.close()
-        
-        return jsonify({
-            "total_images": count,
-            "database": "PostgreSQL + pgvector",
-            "storage": "S3 (MinIO)"
-        })
+        count = db.count_rows()
+        return jsonify({"count": count}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 if __name__ == '__main__':
-    port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=5000)
