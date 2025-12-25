@@ -1,110 +1,90 @@
 import gradio as gr
 import requests
+import os
 from PIL import Image
 import io
-import os
-import numpy as np
 
-API_URL = os.getenv("API_URL", "http://localhost:5000")
-UI_PORT = int(os.getenv("UI_PORT", 7860))
+API_URL = os.getenv("API_URL", "http://api:5000")
+UI_PORT = int(os.getenv("UI_PORT", "7860"))
 
 def find_similar_cats(image):
-    """Отправляет изображение на API и получает похожих котиков"""
     if image is None:
         return []
+
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format='JPEG')
+    img_byte_arr.seek(0)
+    
+    files = {'file': ('query.jpg', img_byte_arr, 'image/jpeg')}
     
     try:
-        # Конвертируем изображение в байты
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='PNG')
-        img_byte_arr = img_byte_arr.getvalue()
-        
-        # Отправляем на API
-        files = {'file': ('image.png', img_byte_arr, 'image/png')}
         response = requests.post(f"{API_URL}/similar", files=files)
+        response.raise_for_status()
+        data = response.json()
         
-        if response.status_code == 200:
-            results = response.json().get('results', [])
+        result_images = []
+        for item in data:
+            s3_path = item['s3_path']
+            dist = item['distance']
             
-            # Загружаем реальные изображения из S3
-            similar_images = []
-            for result in results[:5]:  # Берем первые 5 результатов
-                try:
-                    # Скачиваем изображение по URL
-                    img_url = result.get('url')
-                    if img_url:
-                        img_response = requests.get(img_url, stream=True)
-                        img = Image.open(io.BytesIO(img_response.content))
-                        similar_images.append(img)
-                except Exception as e:
-                    print(f"Error loading image: {e}")
-                    # Если не удалось загрузить, используем заглушку
-                    img = Image.new('RGB', (224, 224), color='gray')
-                    similar_images.append(img)
-            
-            return similar_images
-        else:
-            return [Image.new('RGB', (224, 224), color='red')]
-            
+            # Загружаем саму картинку
+            img_resp = requests.get(f"{API_URL}/image/{s3_path}")
+            if img_resp.status_code == 200:
+                pil_img = Image.open(io.BytesIO(img_resp.content))
+                result_images.append((pil_img, f"Dist: {dist:.4f}"))
+        
+        return result_images
+        
     except Exception as e:
         print(f"Error: {e}")
-        return [Image.new('RGB', (224, 224), color='gray')]
+        return []
 
-# Создаем интерфейс
-with gr.Blocks(title="Поиск похожих котиков 🐱", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🐱 Поиск похожих котиков")
-    gr.Markdown("Загрузите фото котика, и мы найдем похожих!")
-    
-    with gr.Row():
-        with gr.Column(scale=1):
-            input_image = gr.Image(
-                label="Загрузите фото котика", 
-                type="pil",
-                height=300
-            )
-            submit_btn = gr.Button("Найти похожих", variant="primary")
-            gr.Markdown("### Или")
-            upload_btn = gr.UploadButton(
-                "Загрузить котика в базу",
-                file_types=["image"]
-            )
+def upload_cat(image):
+    if image is None:
+        return "No image provided"
         
-        with gr.Column(scale=2):
-            output_gallery = gr.Gallery(
-                label="Похожие котики",
-                show_label=True,
-                columns=3,
-                height=400
-            )
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format='JPEG')
+    img_byte_arr.seek(0)
     
-    # Обработчики
-    submit_btn.click(
-        fn=find_similar_cats,
-        inputs=input_image,
-        outputs=output_gallery
-    )
-    
-    def upload_to_db(file):
-    """Загружает изображение в базу данных"""
-    if file is None:
-        return "Пожалуйста, выберите файл"
+    files = {'file': ('upload.jpg', img_byte_arr, 'image/jpeg')}
     
     try:
-        # Получаем содержимое файла из объекта Gradio
-        with open(file.name, 'rb') as f:
-            files = {'file': f}
-            response = requests.post(f"{API_URL}/upload", files=files)
-        
-        if response.status_code == 200:
-            return "Котик успешно добавлен в базу! 🎉"
-        else:
-            return f"Ошибка: {response.json().get('error', 'Unknown error')}"
+        response = requests.post(f"{API_URL}/upload", files=files)
+        return str(response.json())
     except Exception as e:
-        return f"Ошибка: {str(e)}"
+        return f"Error: {e}"
+
+def get_stats():
+    try:
+        response = requests.get(f"{API_URL}/stats")
+        return str(response.json())
+    except Exception as e:
+        return f"Error: {e}"
+
+with gr.Blocks() as demo:
+    gr.Markdown("# Cat Similarity Search")
+    
+    with gr.Tab("Search Similar"):
+        with gr.Row():
+            in_image = gr.Image(type="pil", label="Upload your cat")
+            search_btn = gr.Button("Find Friends")
+        
+        gallery = gr.Gallery(label="Similar Cats").style(columns=5, height="auto")
+        search_btn.click(fn=find_similar_cats, inputs=in_image, outputs=gallery)
+
+    with gr.Tab("Upload to DB"):
+        with gr.Row():
+            upload_image_in = gr.Image(type="pil", label="New Cat")
+            upload_btn = gr.Button("Add to Database")
+        
+        out_text = gr.Textbox(label="Status")
+        upload_btn.click(fn=upload_cat, inputs=upload_image_in, outputs=out_text)
+        
+    with gr.Tab("Stats"):
+        refresh_btn = gr.Button("Refresh Stats")
+        stats_text = gr.Textbox()
+        refresh_btn.click(fn=get_stats, inputs=None, outputs=stats_text)
 
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0", 
-        server_port=UI_PORT,
-        share=False
-    )
+    demo.launch(server_name="0.0.0.0", server_port=UI_PORT)
